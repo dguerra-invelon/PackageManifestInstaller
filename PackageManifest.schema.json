@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "PackageManifest.schema.json",
+  "title": "INVELON Package Manifest",
+  "description": "Schema for *.dependencies.json files consumed by PackageManifestInstaller. Any file ending in .dependencies.json found anywhere in the project is auto-discovered and shown as a tab in the installer window. To add a new template, create a new *.dependencies.json file anywhere inside its XLINK'd folder.",
+  "type": "object",
+  "required": ["schemaVersion", "templateName", "packages"],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "description": "Schema version for forward-compatibility checks. Current version: '2.0'.",
+      "enum": ["2.0"]
+    },
+    "templateName": {
+      "type": "string",
+      "description": "Human-readable name shown as the tab label in the installer. E.g. 'InvelonARVsion VR Template'."
+    },
+    "unityVersion": {
+      "type": "string",
+      "description": "Minimum Unity version required. Informational only. E.g. '6000.3'."
+    },
+    "renderPipeline": {
+      "type": "string",
+      "description": "Render pipeline required. Informational only. E.g. 'URP', 'HDRP', 'Built-in'."
+    },
+    "menuGroup": {
+      "type": "string",
+      "description": "Optional. If provided, the installer registers a MenuItem shortcut under this path. E.g. 'INVELON/VR Template'. Leave empty to omit the shortcut."
+    },
+    "packages": {
+      "type": "array",
+      "description": "List of UPM packages required by this template.",
+      "items": {
+        "type": "object",
+        "required": ["id", "version", "source", "displayName"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "UPM package identifier. E.g. 'com.unity.xr.interaction.toolkit'."
+          },
+          "version": {
+            "type": "string",
+            "description": "Minimum required version (semantic). For 'git' and 'assetstore' packages used only as display info. E.g. '3.3.1'."
+          },
+          "source": {
+            "type": "string",
+            "description": "Package source. 'registry' = Unity Registry. 'git' = Git URL. 'openupm' = OpenUPM scoped registry. 'tarball' = local .tgz file placed in the project's Packages/ folder. 'assetstore' = Unity Asset Store (manual download required via Package Manager > My Assets).",
+            "enum": ["registry", "git", "openupm", "tarball", "assetstore"]
+          },
+          "url": {
+            "type": "string",
+            "description": "Required for 'git' (full Git URL with optional #tag/branch, e.g. 'https://github.com/Org/Repo.git#1.0.0') and 'openupm' (registry URL, always 'https://package.openupm.com')."
+          },
+          "scopeName": {
+            "type": "string",
+            "description": "Optional. For 'openupm' only. Display name for the scoped registry entry in manifest.json. Defaults to the 'url' value if omitted. E.g. 'package.openupm.com'."
+          },
+          "tgzFileName": {
+            "type": "string",
+            "description": "Required for 'tarball'. Name of the .tgz file that must be placed inside the project's Packages/ folder. Defaults to '{id}-{version}.tgz' if omitted. E.g. 'com.xoia.basicscripts-0.0.22.tgz'."
+          },
+          "assetStoreId": {
+            "type": "string",
+            "description": "Optional. For 'assetstore' only. Numeric Asset Store product ID. Used to build a direct link to the asset page. E.g. '32416' for DOTween Pro."
+          },
+          "assetFolderPath": {
+            "type": "string",
+            "description": "Optional. For 'assetstore' only. Relative path under Assets/ where the package is imported. Used to auto-detect installation without requiring a manual Mark OK click. E.g. 'Demigiant/DOTweenPro' for DOTween Pro or 'Plugins/I2' for I2 Localization."
+          },
+          "displayName": {
+            "type": "string",
+            "description": "Human-readable package name shown in the installer table. E.g. 'XR Interaction Toolkit'."
+          },
+          "optional": {
+            "type": "boolean",
+            "description": "If true, the package is shown in a separate 'Optional' section and excluded from 'Install All'. Defaults to false.",
+            "default": false
+          },
+          "installNote": {
+            "type": "string",
+            "description": "Note shown below the package row. For 'assetstore' packages this field is required and must follow the format: 'Login to [unity_account] where you have the asset and download [asset_name] [asset_version] from Package Manager - My Assets.'"
+          }
+        }
+      }
+    }
+  }
+}
