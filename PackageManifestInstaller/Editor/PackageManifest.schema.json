@@ -40,12 +40,12 @@
           },
           "version": {
             "type": "string",
-            "description": "Minimum required version (semantic). For 'git' packages used only as display info. E.g. '3.3.1'."
+            "description": "Minimum required version (semantic). For 'git' and 'assetstore' packages used only as display info. E.g. '3.3.1'."
           },
           "source": {
             "type": "string",
-            "description": "Package source. 'registry' = Unity Registry. 'git' = Git URL. 'openupm' = OpenUPM scoped registry.",
-            "enum": ["registry", "git", "openupm"]
+            "description": "Package source. 'registry' = Unity Registry. 'git' = Git URL. 'openupm' = OpenUPM scoped registry. 'tarball' = local .tgz file placed in the project's Packages/ folder. 'assetstore' = Unity Asset Store (manual download required via Package Manager > My Assets).",
+            "enum": ["registry", "git", "openupm", "tarball", "assetstore"]
           },
           "url": {
             "type": "string",
@@ -54,6 +54,18 @@
           "scopeName": {
             "type": "string",
             "description": "Optional. For 'openupm' only. Display name for the scoped registry entry in manifest.json. Defaults to the 'url' value if omitted. E.g. 'package.openupm.com'."
+          },
+          "tgzFileName": {
+            "type": "string",
+            "description": "Required for 'tarball'. Name of the .tgz file that must be placed inside the project's Packages/ folder. Defaults to '{id}-{version}.tgz' if omitted. E.g. 'com.xoia.basicscripts-0.0.22.tgz'."
+          },
+          "assetStoreId": {
+            "type": "string",
+            "description": "Optional. For 'assetstore' only. Numeric Asset Store product ID. Used to build a direct link to the asset page. E.g. '32416' for DOTween Pro."
+          },
+          "assetFolderPath": {
+            "type": "string",
+            "description": "Optional. For 'assetstore' only. Relative path under Assets/ where the package is imported. Used to auto-detect installation without requiring a manual Mark OK click. E.g. 'Demigiant/DOTweenPro' for DOTween Pro or 'Plugins/I2' for I2 Localization."
           },
           "displayName": {
             "type": "string",
@@ -66,7 +78,7 @@
           },
           "installNote": {
             "type": "string",
-            "description": "Optional note shown below the package row. Use for manual fallback instructions or caveats."
+            "description": "Note shown below the package row. For 'assetstore' packages this field is required and must follow the format: 'Login to [unity_account] where you have the asset and download [asset_name] [asset_version] from Package Manager - My Assets.'"
           }
         }
       }
