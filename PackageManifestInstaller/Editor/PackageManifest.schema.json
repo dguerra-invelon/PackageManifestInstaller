@@ -8,7 +8,7 @@
   "properties": {
     "schemaVersion": {
       "type": "string",
-      "description": "Schema version for forward-compatibility checks. Current version: '2.0'.",
+      "description": "Schema version for forward-compatibility checks. Write '2.0'. The installer accepts any 2.x manifest (minor bumps are additive; a major bump is a breaking change).",
       "enum": ["2.0"]
     },
     "templateName": {
@@ -25,7 +25,7 @@
     },
     "menuGroup": {
       "type": "string",
-      "description": "Optional. If provided, the installer registers a MenuItem shortcut under this path. E.g. 'INVELON/VR Template'. Leave empty to omit the shortcut."
+      "description": "Optional. Informational metadata for grouping templates. Reserved for future use — the installer does not currently register menu shortcuts. E.g. 'INVELON/VR Template'."
     },
     "packages": {
       "type": "array",
@@ -61,7 +61,7 @@
           },
           "assetStoreId": {
             "type": "string",
-            "description": "Optional. For 'assetstore' only. Numeric Asset Store product ID. Used to build a direct link to the asset page. E.g. '32416' for DOTween Pro."
+            "description": "Optional. For 'assetstore' only. Numeric Asset Store product ID. When present, the installer shows an 'Open Page' button linking to https://assetstore.unity.com/packages/slug/{id}. E.g. '32416' for DOTween Pro."
           },
           "assetFolderPath": {
             "type": "string",

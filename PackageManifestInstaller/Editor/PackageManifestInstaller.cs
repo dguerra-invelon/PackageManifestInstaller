@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
-using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEditor.PackageManager;
 using UnityEditor.PackageManager.Requests;
@@ -13,118 +11,57 @@ namespace INVELON.Editor
 {
     /// <summary>
     /// Generic multi-template Package Manager installer.
-    /// Auto-discovers every *.dependencies.json file in the project (schema v2.0).
+    /// Auto-discovers every *.dependencies.json file in the project (schema v2.x).
     /// Each discovered manifest appears as a tab in the window.
     /// Lives in its own .asmdef with no external references so it compiles
     /// even when other assemblies have errors due to missing packages.
     /// Access via INVELON > Package Manager > Dependency Installer.
+    ///
+    /// The install queue survives domain reloads (see InstallQueueState), so
+    /// "Install pending" completes even when installed packages trigger recompiles.
     /// </summary>
     public class PackageManifestInstaller : EditorWindow
     {
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Schema data model  (matches PackageManifest.schema.json  v2.0)
-        //  Uses [Serializable] + public fields for JsonUtility compatibility.
-        // ──────────────────────────────────────────────────────────────────────────
+        private const string MenuPath = "INVELON/Package Manager/Dependency Installer";
 
-        [Serializable]
-        private class TemplateManifest
-        {
-            public string            schemaVersion;
-            public string            templateName;
-            public string            unityVersion;
-            public string            renderPipeline;
-            public string            menuGroup;
-            public List<PackageEntry> packages = new List<PackageEntry>();
-        }
+        // ── State ─────────────────────────────────────────────────────────────
 
-        [Serializable]
-        private class PackageEntry
-        {
-            public string id;
-            public string version;
-            public string source;         // "registry" | "git" | "openupm" | "tarball" | "assetstore"
-            public string url;
-            public string scopeName;
-            public string tgzFileName;    // used when source == "tarball"
-            public string assetStoreId;    // used when source == "assetstore" (numeric product ID)
-            public string assetFolderPath; // used when source == "assetstore": relative path under Assets/ to detect install
-            public string displayName;
-            public bool   optional;
-            public string installNote;
-        }
+        private List<TemplateTab> _tabs = new List<TemplateTab>();
+        private int               _activeTabIdx;
+        private string            _discoveryError;
 
-        private enum PackageStatus { Loading, Installed, VersionLow, Missing, Error }
+        private ListRequest       _listRequest;
+        private AddRequest        _addRequest;
+        private readonly Queue<PackageRow> _installQueue = new Queue<PackageRow>();
+        private bool              _isInstalling;
+        private bool              _cancelRequested;
+        private int               _totalToInstall;
+        private int               _installedCount;
+        private string            _installTabAssetPath;
 
-        private class PackageRow
-        {
-            public PackageEntry  Entry;
-            public PackageStatus Status;
-            public string        InstalledVersion;
-            public string        ErrorMessage;
-        }
+        private Vector2           _scroll;
 
-        /// <summary>One discovered *.dependencies.json file and its parsed rows.</summary>
-        private class TemplateTab
-        {
-            public string            ManifestPath;
-            public string            AssetPath;
-            public TemplateManifest  Manifest;
-            public string            LoadError;
-            public List<PackageRow>  Rows = new List<PackageRow>();
-        }
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Constants
-        // ──────────────────────────────────────────────────────────────────────────
-
-        private const string SupportedSchemaVersion = "2.0";
-        private const string MenuPath               = "INVELON/Package Manager/Dependency Installer";
-
-        private static readonly Color ColorOk      = new Color(0.35f, 0.80f, 0.35f);
-        private static readonly Color ColorWarn    = new Color(0.95f, 0.75f, 0.20f);
-        private static readonly Color ColorError   = new Color(0.90f, 0.35f, 0.35f);
-        private static readonly Color ColorNeutral = new Color(0.55f, 0.55f, 0.55f);
-        private static readonly Color ColorInstall = new Color(0.25f, 0.55f, 0.90f);
-        private static readonly Color ColorExport  = new Color(0.45f, 0.45f, 0.65f);
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  State
-        // ──────────────────────────────────────────────────────────────────────────
-
-        private List<TemplateTab>  _tabs         = new List<TemplateTab>();
-        private int                _activeTabIdx = 0;
-        private string             _discoveryError;
-
-        private ListRequest        _listRequest;
-        private AddRequest         _addRequest;
-        private Queue<PackageRow>  _installQueue = new Queue<PackageRow>();
-        private bool               _isInstalling;
-        private int                _totalToInstall;
-        private int                _installedCount;
-
-        private Vector2            _scroll;
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Menu item
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── Menu item ─────────────────────────────────────────────────────────
 
         /// <summary>Opens the Package Manifest Installer window.</summary>
         [MenuItem(MenuPath)]
         public static void OpenWindow()
         {
-            var w = GetWindow<PackageManifestInstaller>("Dependency Installer");
+            var w = GetWindow<PackageManifestInstaller>(InstallerStrings.WindowTitle);
             w.minSize = new Vector2(560, 460);
             w.Show();
         }
 
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Lifecycle
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── Lifecycle ─────────────────────────────────────────────────────────
 
         private void OnEnable()
         {
             DiscoverAndLoadManifests();
-            StartListRequest();
+
+            // If a batch install was interrupted by a domain reload, resume it.
+            // ProcessQueue refreshes package statuses when the queue drains.
+            if (!TryResumePendingInstall())
+                StartListRequest();
         }
 
         private void OnDisable()
@@ -133,11 +70,17 @@ namespace INVELON.Editor
             EditorApplication.update -= PollAddRequest;
         }
 
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Discovery + manifest loading
-        // ──────────────────────────────────────────────────────────────────────────
+        private void OnDestroy()
+        {
+            // Window closed (not a domain reload): don't leave a stuck modal progress
+            // bar behind. Any pending queue stays in SessionState and resumes the next
+            // time the window is opened.
+            if (_isInstalling)
+                EditorUtility.ClearProgressBar();
+        }
 
-        /// <summary>Finds every *.dependencies.json TextAsset in the project and loads it.</summary>
+        // ── Discovery + manifest loading ──────────────────────────────────────
+
         private void DiscoverAndLoadManifests()
         {
             _discoveryError = null;
@@ -148,75 +91,22 @@ namespace INVELON.Editor
             List<string> matchingPaths = guids
                 .Select(AssetDatabase.GUIDToAssetPath)
                 .Where(p => p.EndsWith(".dependencies.json", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(p => p)
+                .Distinct()
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
             if (matchingPaths.Count == 0)
             {
-                _discoveryError = "No se encontraron archivos *.dependencies.json en el proyecto.\n" +
-                                  "Asegurate de que el XLINK de _VRTemplate esta correctamente aplicado,\n" +
-                                  "o crea un nuevo archivo siguiendo PackageManifest.schema.json.";
+                _discoveryError = InstallerStrings.NoManifestsFound;
                 return;
             }
 
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
             foreach (string assetPath in matchingPaths)
-                _tabs.Add(LoadTab(assetPath));
+                _tabs.Add(ManifestLoader.Load(assetPath, projectRoot));
         }
 
-        private TemplateTab LoadTab(string assetPath)
-        {
-            var tab = new TemplateTab { AssetPath = assetPath };
-            tab.ManifestPath = Path.GetFullPath(
-                Path.Combine(Application.dataPath, "..", assetPath));
-
-            try
-            {
-                string json = File.ReadAllText(tab.ManifestPath);
-
-                if (string.IsNullOrWhiteSpace(json))
-                {
-                    tab.LoadError = $"{Path.GetFileName(assetPath)} esta vacio.";
-                    return tab;
-                }
-
-                var manifest = JsonUtility.FromJson<TemplateManifest>(json);
-
-                if (manifest == null)
-                {
-                    tab.LoadError = $"No se pudo deserializar {Path.GetFileName(assetPath)}.";
-                    return tab;
-                }
-
-                if (manifest.schemaVersion != SupportedSchemaVersion)
-                {
-                    tab.LoadError = $"Schema version '{manifest.schemaVersion}' no compatible. " +
-                                    $"Se requiere '{SupportedSchemaVersion}'.\n" +
-                                    $"Actualiza el campo schemaVersion en {Path.GetFileName(assetPath)}.";
-                    return tab;
-                }
-
-                if (manifest.packages == null || manifest.packages.Count == 0)
-                {
-                    tab.LoadError = $"{Path.GetFileName(assetPath)} no contiene paquetes.";
-                    return tab;
-                }
-
-                tab.Manifest = manifest;
-
-                foreach (PackageEntry entry in manifest.packages)
-                    tab.Rows.Add(new PackageRow { Entry = entry, Status = PackageStatus.Loading });
-            }
-            catch (Exception ex)
-            {
-                tab.LoadError = $"Error al parsear {Path.GetFileName(assetPath)}:\n{ex.Message}";
-            }
-
-            return tab;
-        }
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Package listing
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── Package listing ───────────────────────────────────────────────────
 
         private void StartListRequest()
         {
@@ -247,7 +137,7 @@ namespace INVELON.Editor
             }
             else
             {
-                string errorMsg = _listRequest.Error?.message ?? "Error desconocido al listar paquetes.";
+                string errorMsg = _listRequest.Error?.message ?? InstallerStrings.LogListError;
                 foreach (TemplateTab tab in _tabs)
                     foreach (PackageRow row in tab.Rows)
                     {
@@ -260,14 +150,14 @@ namespace INVELON.Editor
             Repaint();
         }
 
-        private void UpdateRowStatuses(List<PackageRow> rows, Dictionary<string, string> installedMap)
+        private static void UpdateRowStatuses(List<PackageRow> rows, Dictionary<string, string> installedMap)
         {
             foreach (PackageRow row in rows)
             {
                 row.ErrorMessage = null;
 
                 // Asset Store packages are not tracked by UPM — use folder/EditorPrefs detection
-                if (row.Entry.source == "assetstore")
+                if (row.Entry.source == PackageSourceIds.AssetStore)
                 {
                     if (IsAssetStorePackageInstalled(row.Entry))
                     {
@@ -291,38 +181,21 @@ namespace INVELON.Editor
 
                 row.InstalledVersion = installedVersion;
 
-                // Git and openupm: presence check only, no version comparison
-                if (row.Entry.source != "registry")
+                // Git, openupm and tarball: presence check only, no version comparison
+                if (row.Entry.source != PackageSourceIds.Registry)
                 {
                     row.Status = PackageStatus.Installed;
                     continue;
                 }
 
                 // Registry: semantic version comparison
-                if (TryParseVersion(installedVersion, out Version installed) &&
-                    TryParseVersion(row.Entry.version,  out Version required))
-                {
-                    row.Status = installed >= required ? PackageStatus.Installed : PackageStatus.VersionLow;
-                }
-                else
-                {
-                    int cmp = string.Compare(installedVersion, row.Entry.version, StringComparison.OrdinalIgnoreCase);
-                    row.Status = cmp >= 0 ? PackageStatus.Installed : PackageStatus.VersionLow;
-                }
+                row.Status = VersionUtil.Satisfies(installedVersion, row.Entry.version)
+                    ? PackageStatus.Installed
+                    : PackageStatus.VersionLow;
             }
         }
 
-        /// <summary>Parses a version string, stripping pre-release suffixes (e.g. "1.5.9-pre.1" → 1.5.9).</summary>
-        private static bool TryParseVersion(string raw, out Version version)
-        {
-            int    dashIdx = raw.IndexOf('-');
-            string clean   = dashIdx >= 0 ? raw.Substring(0, dashIdx) : raw;
-            return Version.TryParse(clean, out version);
-        }
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  GUI — top level
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── GUI — top level ───────────────────────────────────────────────────
 
         private void OnGUI()
         {
@@ -355,7 +228,7 @@ namespace INVELON.Editor
                 DrawFooter(active);
         }
 
-        // ── Tool header ───────────────────────────────────────────────────────────
+        // ── Tool header ───────────────────────────────────────────────────────
 
         private void DrawToolHeader()
         {
@@ -364,14 +237,24 @@ namespace INVELON.Editor
             using (new EditorGUILayout.HorizontalScope())
             {
                 EditorGUILayout.LabelField(
-                    "Dependency Installer",
+                    InstallerStrings.HeaderTitle,
                     new GUIStyle(EditorStyles.boldLabel) { fontSize = 13 });
 
                 GUILayout.FlexibleSpace();
 
+                if (_tabs.Count > 0 &&
+                    GUILayout.Button(
+                        new GUIContent(InstallerStrings.LocateButton, InstallerStrings.LocateTooltip),
+                        EditorStyles.miniButton, GUILayout.Width(56)))
+                {
+                    PingTabAsset(_tabs[_activeTabIdx]);
+                }
+
                 using (new EditorGUI.DisabledGroupScope(_isInstalling || _listRequest != null))
                 {
-                    if (GUILayout.Button("↺ Refrescar", EditorStyles.miniButton, GUILayout.Width(80)))
+                    if (GUILayout.Button(
+                            new GUIContent(InstallerStrings.RefreshButton, InstallerStrings.RefreshTooltip),
+                            EditorStyles.miniButton, GUILayout.Width(80)))
                     {
                         DiscoverAndLoadManifests();
                         StartListRequest();
@@ -380,57 +263,46 @@ namespace INVELON.Editor
             }
 
             EditorGUILayout.LabelField(
-                $"{_tabs.Count} plantilla(s) detectada(s)   ·   *.dependencies.json",
+                string.Format(InstallerStrings.TemplatesDetected, _tabs.Count),
                 EditorStyles.miniLabel);
 
             EditorGUILayout.Space(4);
         }
 
-        // ── Tab bar ───────────────────────────────────────────────────────────────
+        // ── Tab bar ───────────────────────────────────────────────────────────
 
         private void DrawTabs()
         {
-            string[] labels = _tabs
-                .Select(t => t.Manifest?.templateName ?? Path.GetFileName(t.AssetPath))
-                .ToArray();
-
             using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
             {
-                for (int i = 0; i < labels.Length; i++)
+                for (int i = 0; i < _tabs.Count; i++)
                 {
-                    bool   isActive = i == _activeTabIdx;
-                    bool   hasError = !string.IsNullOrEmpty(_tabs[i].LoadError);
-                    string label    = hasError ? $"⚠ {labels[i]}" : labels[i];
+                    TemplateTab tab      = _tabs[i];
+                    bool        isActive = i == _activeTabIdx;
+                    bool        hasError = !string.IsNullOrEmpty(tab.LoadError);
+                    string      name     = tab.Manifest?.templateName ?? Path.GetFileName(tab.AssetPath);
+                    string      label    = hasError ? $"⚠ {name}" : name;
 
                     GUIStyle style = isActive
                         ? new GUIStyle(EditorStyles.toolbarButton) { fontStyle = FontStyle.Bold }
                         : EditorStyles.toolbarButton;
 
-                    if (GUILayout.Toggle(isActive, label, style, GUILayout.MinWidth(120)))
+                    if (GUILayout.Toggle(isActive, new GUIContent(label, tab.AssetPath), style, GUILayout.MinWidth(120)))
                         _activeTabIdx = i;
-
-                    if (Event.current.type == EventType.MouseDown &&
-                        GUILayoutUtility.GetLastRect().Contains(Event.current.mousePosition))
-                    {
-                        PingTabAsset(_tabs[i]);
-                        Event.current.Use();
-                    }
                 }
 
                 GUILayout.FlexibleSpace();
             }
         }
 
-        // ── Tab error ─────────────────────────────────────────────────────────────
+        // ── Errors ────────────────────────────────────────────────────────────
 
         private void DrawTabError(TemplateTab tab)
         {
             EditorGUILayout.Space(8);
             EditorGUILayout.HelpBox(tab.LoadError, MessageType.Error);
-            EditorGUILayout.LabelField($"Archivo: {tab.AssetPath}", EditorStyles.miniLabel);
+            EditorGUILayout.LabelField(string.Format(InstallerStrings.FileLabel, tab.AssetPath), EditorStyles.miniLabel);
         }
-
-        // ── Discovery error ───────────────────────────────────────────────────────
 
         private void DrawDiscoveryError()
         {
@@ -438,25 +310,28 @@ namespace INVELON.Editor
             EditorGUILayout.HelpBox(_discoveryError, MessageType.Warning);
             EditorGUILayout.Space(4);
 
-            if (GUILayout.Button("Reintentar descubrimiento"))
+            if (GUILayout.Button(InstallerStrings.RetryDiscovery))
             {
                 DiscoverAndLoadManifests();
                 StartListRequest();
             }
         }
 
-        // ── Package table ─────────────────────────────────────────────────────────
+        // ── Package table ─────────────────────────────────────────────────────
 
         private void DrawPackageTable(TemplateTab tab)
         {
             EditorGUILayout.Space(4);
 
+            if (!string.IsNullOrEmpty(tab.LoadWarning))
+                EditorGUILayout.HelpBox(tab.LoadWarning, MessageType.Info);
+
             if (!string.IsNullOrEmpty(tab.Manifest.unityVersion) ||
                 !string.IsNullOrEmpty(tab.Manifest.renderPipeline))
             {
                 EditorGUILayout.LabelField(
-                    $"Unity {tab.Manifest.unityVersion}  ·  {tab.Manifest.renderPipeline}  " +
-                    $"·  {tab.Manifest.packages.Count} paquete(s)",
+                    string.Format(InstallerStrings.ManifestInfo,
+                        tab.Manifest.unityVersion, tab.Manifest.renderPipeline, tab.Manifest.packages.Count),
                     EditorStyles.miniLabel);
             }
 
@@ -465,12 +340,12 @@ namespace INVELON.Editor
             List<PackageRow> required = tab.Rows.Where(r => !r.Entry.optional).ToList();
             List<PackageRow> optional = tab.Rows.Where(r =>  r.Entry.optional).ToList();
 
-            DrawPackageSection("Requeridos", required);
+            DrawPackageSection(InstallerStrings.SectionRequired, required);
 
             if (optional.Count > 0)
             {
                 EditorGUILayout.Space(6);
-                DrawPackageSection("Opcionales", optional);
+                DrawPackageSection(InstallerStrings.SectionOptional, optional);
             }
         }
 
@@ -478,13 +353,12 @@ namespace INVELON.Editor
         {
             using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
             {
-                EditorGUILayout.LabelField(sectionLabel, EditorStyles.toolbarButton, GUILayout.Width(90));
-                EditorGUILayout.LabelField("Paquete",    EditorStyles.toolbarButton, GUILayout.Width(185));
-                EditorGUILayout.LabelField("Requerida",  EditorStyles.toolbarButton, GUILayout.Width(68));
-                EditorGUILayout.LabelField("Instalada",  EditorStyles.toolbarButton, GUILayout.Width(75));
-                EditorGUILayout.LabelField("Estado",     EditorStyles.toolbarButton, GUILayout.Width(90));
-                GUILayout.FlexibleSpace();
-                EditorGUILayout.LabelField("",           EditorStyles.toolbarButton, GUILayout.Width(80));
+                EditorGUILayout.LabelField(sectionLabel, EditorStyles.toolbarButton,
+                    GUILayout.MinWidth(140), GUILayout.ExpandWidth(true));
+                EditorGUILayout.LabelField(InstallerStrings.ColRequired,  EditorStyles.toolbarButton, GUILayout.Width(68));
+                EditorGUILayout.LabelField(InstallerStrings.ColInstalled, EditorStyles.toolbarButton, GUILayout.Width(75));
+                EditorGUILayout.LabelField(InstallerStrings.ColStatus,    EditorStyles.toolbarButton, GUILayout.Width(90));
+                EditorGUILayout.LabelField("", EditorStyles.toolbarButton, GUILayout.Width(166));
             }
 
             foreach (PackageRow row in rows)
@@ -495,12 +369,9 @@ namespace INVELON.Editor
         {
             bool isLoading = row.Status == PackageStatus.Loading || _listRequest != null;
 
-            // For tarball packages, check whether the .tgz file is already in Packages/
-            bool isTarball      = row.Entry.source == "tarball";
+            bool isTarball      = row.Entry.source == PackageSourceIds.Tarball;
             bool tarballMissing = isTarball && !TarballFileExists(row.Entry);
-
-            // Asset Store packages cannot be installed automatically
-            bool isAssetStore = row.Entry.source == "assetstore";
+            bool isAssetStore   = row.Entry.source == PackageSourceIds.AssetStore;
 
             using (new EditorGUILayout.VerticalScope())
             {
@@ -508,158 +379,167 @@ namespace INVELON.Editor
                 {
                     DrawSourceBadge(row.Entry.source);
 
+                    // Flexible name column — full id + note shown as tooltip
                     EditorGUILayout.LabelField(
                         new GUIContent(row.Entry.displayName ?? row.Entry.id, row.Entry.id),
-                        GUILayout.Width(185));
+                        GUILayout.MinWidth(112), GUILayout.ExpandWidth(true));
 
-                    EditorGUILayout.LabelField(row.Entry.version, GUILayout.Width(68));
+                    EditorGUILayout.LabelField(row.Entry.version ?? "—", GUILayout.Width(68));
 
                     EditorGUILayout.LabelField(
-                        isLoading ? "\u2026" : (row.InstalledVersion ?? "—"),
+                        isLoading ? "…" : (row.InstalledVersion ?? "—"),
                         GUILayout.Width(75));
 
                     DrawStatusBadge(row.Status, isLoading);
 
-                    GUILayout.FlexibleSpace();
-
-                    if (isAssetStore)
+                    // Fixed-width action area keeps all columns aligned across rows
+                    using (new EditorGUILayout.HorizontalScope(GUILayout.Width(166)))
                     {
-                        bool markedInstalled = EditorPrefs.GetBool(AssetStorePrefsKey(row.Entry), false);
-
-                        if (row.Status == PackageStatus.Installed)
-                        {
-                            // Show a muted "Unmark" button so the dev can reset if needed
-                            Color oldBg2 = GUI.backgroundColor;
-                            GUI.backgroundColor = ColorNeutral;
-                            if (GUILayout.Button("Unmark", GUILayout.Width(78)))
-                            {
-                                EditorPrefs.DeleteKey(AssetStorePrefsKey(row.Entry));
-                                row.Status           = PackageStatus.Missing;
-                                row.InstalledVersion = "—";
-                            }
-                            GUI.backgroundColor = oldBg2;
-                        }
+                        if (isAssetStore)
+                            DrawAssetStoreActions(row);
                         else
-                        {
-                            // Show a green "Mark Installed" button
-                            Color oldBg2 = GUI.backgroundColor;
-                            GUI.backgroundColor = ColorOk;
-                            if (GUILayout.Button("Mark OK", GUILayout.Width(78)))
-                            {
-                                EditorPrefs.SetBool(AssetStorePrefsKey(row.Entry), true);
-                                row.Status           = PackageStatus.Installed;
-                                row.InstalledVersion = row.Entry.version;
-                            }
-                            GUI.backgroundColor = oldBg2;
-                        }
-                    }
-                    else
-                    {
-                        bool canInstall = !isLoading && !_isInstalling &&
-                                          row.Status != PackageStatus.Installed &&
-                                          !tarballMissing;
-
-                        using (new EditorGUI.DisabledGroupScope(!canInstall))
-                        {
-                            Color oldBg = GUI.backgroundColor;
-                            GUI.backgroundColor = canInstall ? ColorInstall : ColorNeutral;
-
-                            if (GUILayout.Button("Instalar", GUILayout.Width(78)))
-                                InstallSingle(row);
-
-                            GUI.backgroundColor = oldBg;
-                        }
+                            DrawInstallAction(row, isLoading, tarballMissing);
                     }
                 }
 
-                if (tarballMissing)
-                {
-                    string tgzName = string.IsNullOrEmpty(row.Entry.tgzFileName)
-                        ? $"{row.Entry.id}-{row.Entry.version}.tgz"
-                        : row.Entry.tgzFileName;
-
-                    EditorGUILayout.LabelField(
-                        $"  \u26a0  Coloca '{tgzName}' en la carpeta Packages/ del proyecto para habilitar la instalación.",
-                        new GUIStyle(EditorStyles.miniLabel) { wordWrap = true, normal = { textColor = ColorWarn } });
-                }
-                else if (isAssetStore && row.Status != PackageStatus.Installed)
-                {
-                    string note = !string.IsNullOrEmpty(row.Entry.installNote)
-                        ? row.Entry.installNote
-                        : $"Login to the Unity account where you have the asset and download {row.Entry.displayName ?? row.Entry.id} {row.Entry.version} from Package Manager - My Assets.";
-
-                    EditorGUILayout.LabelField(
-                        $"  \u24d8  {note}",
-                        new GUIStyle(EditorStyles.miniLabel) { wordWrap = true, normal = { textColor = ColorWarn } });
-                }
-                else if (!string.IsNullOrEmpty(row.Entry.installNote))
-                {
-                    EditorGUILayout.LabelField(
-                        $"  \u24d8  {row.Entry.installNote}",
-                        new GUIStyle(EditorStyles.miniLabel) { wordWrap = true });
-                }
+                DrawRowNotes(row, tarballMissing, isAssetStore);
 
                 if (row.Status == PackageStatus.Error && !string.IsNullOrEmpty(row.ErrorMessage))
                     EditorGUILayout.HelpBox(row.ErrorMessage, MessageType.Error);
             }
         }
 
-        private void DrawSourceBadge(string source)
+        private void DrawAssetStoreActions(PackageRow row)
+        {
+            if (!string.IsNullOrEmpty(row.Entry.assetStoreId))
+            {
+                if (GUILayout.Button(
+                        new GUIContent(InstallerStrings.OpenPageButton, InstallerStrings.OpenPageTooltip),
+                        GUILayout.Width(82)))
+                {
+                    Application.OpenURL($"https://assetstore.unity.com/packages/slug/{row.Entry.assetStoreId}");
+                }
+            }
+            else
+            {
+                GUILayout.FlexibleSpace();
+            }
+
+            bool  installed = row.Status == PackageStatus.Installed;
+            Color oldBg     = GUI.backgroundColor;
+            GUI.backgroundColor = installed ? InstallerColors.Neutral : InstallerColors.Ok;
+
+            GUIContent label = installed
+                ? new GUIContent(InstallerStrings.UnmarkButton, InstallerStrings.UnmarkTooltip)
+                : new GUIContent(InstallerStrings.MarkOkButton, InstallerStrings.MarkOkTooltip);
+
+            if (GUILayout.Button(label, GUILayout.Width(78)))
+            {
+                if (installed)
+                {
+                    EditorPrefs.DeleteKey(AssetStorePrefsKey(row.Entry));
+                    row.Status           = PackageStatus.Missing;
+                    row.InstalledVersion = "—";
+                }
+                else
+                {
+                    EditorPrefs.SetBool(AssetStorePrefsKey(row.Entry), true);
+                    row.Status           = PackageStatus.Installed;
+                    row.InstalledVersion = row.Entry.version;
+                }
+            }
+
+            GUI.backgroundColor = oldBg;
+        }
+
+        private void DrawInstallAction(PackageRow row, bool isLoading, bool tarballMissing)
+        {
+            GUILayout.FlexibleSpace();
+
+            bool canInstall = !isLoading && !_isInstalling &&
+                              row.Status != PackageStatus.Installed &&
+                              !tarballMissing;
+
+            using (new EditorGUI.DisabledGroupScope(!canInstall))
+            {
+                Color oldBg = GUI.backgroundColor;
+                GUI.backgroundColor = canInstall ? InstallerColors.Install : InstallerColors.Neutral;
+
+                if (GUILayout.Button(InstallerStrings.InstallButton, GUILayout.Width(78)))
+                    BeginInstall(_tabs[_activeTabIdx], new[] { row });
+
+                GUI.backgroundColor = oldBg;
+            }
+        }
+
+        private static void DrawRowNotes(PackageRow row, bool tarballMissing, bool isAssetStore)
+        {
+            if (tarballMissing)
+            {
+                EditorGUILayout.LabelField(
+                    string.Format(InstallerStrings.TarballMissingNote, ResolveTgzFileName(row.Entry)),
+                    new GUIStyle(EditorStyles.miniLabel) { wordWrap = true, normal = { textColor = InstallerColors.Warn } });
+            }
+            else if (isAssetStore && row.Status != PackageStatus.Installed)
+            {
+                string note = !string.IsNullOrEmpty(row.Entry.installNote)
+                    ? row.Entry.installNote
+                    : string.Format(InstallerStrings.AssetStoreDefaultNote,
+                        row.Entry.displayName ?? row.Entry.id, row.Entry.version);
+
+                EditorGUILayout.LabelField(
+                    $"  ⓘ  {note}",
+                    new GUIStyle(EditorStyles.miniLabel) { wordWrap = true, normal = { textColor = InstallerColors.Warn } });
+            }
+            else if (!string.IsNullOrEmpty(row.Entry.installNote))
+            {
+                EditorGUILayout.LabelField(
+                    $"  ⓘ  {row.Entry.installNote}",
+                    new GUIStyle(EditorStyles.miniLabel) { wordWrap = true });
+            }
+        }
+
+        private static void DrawSourceBadge(string source)
         {
             string label;
             Color  color;
 
             switch (source)
             {
-                case "git":
-                    label = "GIT";
-                    color = new Color(0.30f, 0.65f, 0.90f);
-                    break;
-                case "openupm":
-                    label = "UPM";
-                    color = new Color(0.65f, 0.45f, 0.90f);
-                    break;
-                case "tarball":
-                    label = "TGZ";
-                    color = new Color(0.90f, 0.60f, 0.20f);
-                    break;
-                case "assetstore":
-                    label = "AST";
-                    color = new Color(0.90f, 0.45f, 0.55f);
-                    break;
-                default:
-                    label = "REG";
-                    color = new Color(0.50f, 0.65f, 0.50f);
-                    break;
+                case PackageSourceIds.Git:        label = "GIT"; color = InstallerColors.SourceGit;        break;
+                case PackageSourceIds.OpenUpm:    label = "UPM"; color = InstallerColors.SourceOpenUpm;    break;
+                case PackageSourceIds.Tarball:    label = "TGZ"; color = InstallerColors.SourceTarball;    break;
+                case PackageSourceIds.AssetStore: label = "AST"; color = InstallerColors.SourceAssetStore; break;
+                default:                          label = "REG"; color = InstallerColors.SourceRegistry;   break;
             }
 
             Color oldContent = GUI.contentColor;
             GUI.contentColor = color;
-            EditorGUILayout.LabelField(label,
+            EditorGUILayout.LabelField(new GUIContent(label, source),
                 new GUIStyle(EditorStyles.boldLabel) { fontSize = 9, alignment = TextAnchor.MiddleCenter },
                 GUILayout.Width(28));
             GUI.contentColor = oldContent;
         }
 
-        private void DrawStatusBadge(PackageStatus status, bool isLoading)
+        private static void DrawStatusBadge(PackageStatus status, bool isLoading)
         {
             string label;
             Color  color;
 
             if (isLoading)
             {
-                label = "Cargando\u2026";
-                color = ColorNeutral;
+                label = InstallerStrings.StatusLoading;
+                color = InstallerColors.Neutral;
             }
             else
             {
                 switch (status)
                 {
-                    case PackageStatus.Installed:  label = "\u2713 OK";       color = ColorOk;      break;
-                    case PackageStatus.VersionLow: label = "\u26a0 Inferior"; color = ColorWarn;    break;
-                    case PackageStatus.Missing:    label = "\u2717 Falta";    color = ColorError;   break;
-                    case PackageStatus.Error:      label = "\u2717 Error";    color = ColorError;   break;
-                    default:                       label = "\u2026";          color = ColorNeutral; break;
+                    case PackageStatus.Installed:  label = InstallerStrings.StatusOk;       color = InstallerColors.Ok;      break;
+                    case PackageStatus.VersionLow: label = InstallerStrings.StatusOutdated; color = InstallerColors.Warn;    break;
+                    case PackageStatus.Missing:    label = InstallerStrings.StatusMissing;  color = InstallerColors.Error;   break;
+                    case PackageStatus.Error:      label = InstallerStrings.StatusError;    color = InstallerColors.Error;   break;
+                    default:                       label = "…";                        color = InstallerColors.Neutral; break;
                 }
             }
 
@@ -669,7 +549,7 @@ namespace INVELON.Editor
             GUI.contentColor = oldContent;
         }
 
-        // ── Footer ────────────────────────────────────────────────────────────────
+        // ── Footer ────────────────────────────────────────────────────────────
 
         private void DrawFooter(TemplateTab tab)
         {
@@ -677,7 +557,7 @@ namespace INVELON.Editor
 
             bool isLoading    = _listRequest != null;
             int  pendingCount = tab.Rows.Count(r => !r.Entry.optional &&
-                                                    r.Entry.source != "assetstore" &&
+                                                    r.Entry.source != PackageSourceIds.AssetStore &&
                                                     r.Status != PackageStatus.Installed);
 
             EditorGUILayout.Space(2);
@@ -685,11 +565,12 @@ namespace INVELON.Editor
             using (new EditorGUILayout.HorizontalScope())
             {
                 Color oldBg = GUI.backgroundColor;
-                GUI.backgroundColor = ColorExport;
+                GUI.backgroundColor = InstallerColors.Export;
 
                 using (new EditorGUI.DisabledGroupScope(isLoading || _isInstalling))
                 {
-                    if (GUILayout.Button("Exportar estado actual \u2192 JSON",
+                    if (GUILayout.Button(
+                            new GUIContent(InstallerStrings.ExportButton, InstallerStrings.ExportTooltip),
                             EditorStyles.miniButton, GUILayout.Width(200)))
                         ExportCurrentPackages(tab);
                 }
@@ -701,26 +582,30 @@ namespace INVELON.Editor
                 if (_isInstalling)
                 {
                     EditorGUILayout.LabelField(
-                        $"Instalando\u2026 ({_installedCount}/{_totalToInstall})",
+                        string.Format(InstallerStrings.InstallingCount, _installedCount, _totalToInstall),
                         EditorStyles.boldLabel);
                 }
                 else
                 {
                     EditorGUILayout.LabelField(
-                        $"{pendingCount} paquete(s) requerido(s) pendiente(s)",
+                        string.Format(InstallerStrings.PendingCount, pendingCount),
                         EditorStyles.miniLabel);
                 }
 
                 bool canInstallAll = !isLoading && !_isInstalling && pendingCount > 0;
 
                 oldBg = GUI.backgroundColor;
-                GUI.backgroundColor = canInstallAll ? ColorInstall : ColorNeutral;
+                GUI.backgroundColor = canInstallAll ? InstallerColors.Install : InstallerColors.Neutral;
 
                 using (new EditorGUI.DisabledGroupScope(!canInstallAll))
                 {
-                    if (GUILayout.Button("Instalar pendientes",
+                    if (GUILayout.Button(InstallerStrings.InstallPendingButton,
                             GUILayout.Height(30), GUILayout.Width(160)))
-                        InstallAll(tab);
+                    {
+                        BeginInstall(tab, tab.Rows.Where(r => !r.Entry.optional &&
+                                                              r.Status != PackageStatus.Installed &&
+                                                              r.Entry.source != PackageSourceIds.AssetStore));
+                    }
                 }
 
                 GUI.backgroundColor = oldBg;
@@ -729,66 +614,117 @@ namespace INVELON.Editor
             EditorGUILayout.Space(8);
         }
 
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Installation logic
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── Installation logic ────────────────────────────────────────────────
 
-        private void InstallSingle(PackageRow row)
+        private void BeginInstall(TemplateTab tab, IEnumerable<PackageRow> rows)
         {
             _installQueue.Clear();
-            _installQueue.Enqueue(row);
-            _totalToInstall = 1;
-            _installedCount = 0;
-            _isInstalling   = true;
+            foreach (PackageRow row in rows)
+                _installQueue.Enqueue(row);
+
+            if (_installQueue.Count == 0) return;
+
+            _installTabAssetPath = tab.AssetPath;
+            _totalToInstall      = _installQueue.Count;
+            _installedCount      = 0;
+            _isInstalling        = true;
+            _cancelRequested     = false;
             ProcessQueue();
         }
 
-        private void InstallAll(TemplateTab tab)
+        /// <summary>Resumes a batch install that was interrupted by a domain reload.</summary>
+        private bool TryResumePendingInstall()
         {
+            if (!InstallQueueState.TryLoad(out string tabPath, out int installed, out int total,
+                                           out List<string> pendingIds))
+                return false;
+
+            TemplateTab tab = _tabs.FirstOrDefault(t => t.AssetPath == tabPath && t.Manifest != null);
+            if (tab == null)
+            {
+                InstallQueueState.Clear();
+                return false;
+            }
+
             _installQueue.Clear();
+            foreach (string id in pendingIds)
+            {
+                PackageRow row = tab.Rows.FirstOrDefault(r => r.Entry.id == id);
+                if (row != null) _installQueue.Enqueue(row);
+            }
 
-            foreach (PackageRow row in tab.Rows.Where(r => !r.Entry.optional &&
-                                                           r.Status != PackageStatus.Installed &&
-                                                           r.Entry.source != "assetstore"))
-                _installQueue.Enqueue(row);
+            if (_installQueue.Count == 0)
+            {
+                InstallQueueState.Clear();
+                return false;
+            }
 
-            _totalToInstall = _installQueue.Count;
-            _installedCount = 0;
-            _isInstalling   = true;
+            _activeTabIdx        = _tabs.IndexOf(tab);
+            _installTabAssetPath = tab.AssetPath;
+            _installedCount      = installed;
+            _totalToInstall      = total;
+            _isInstalling        = true;
+            _cancelRequested     = false;
+
+            Debug.Log(string.Format(InstallerStrings.LogResumedQueue, _installQueue.Count));
             ProcessQueue();
+            return true;
         }
 
         private void ProcessQueue()
         {
+            if (_cancelRequested && _installQueue.Count > 0)
+            {
+                Debug.Log(string.Format(InstallerStrings.LogInstallCancelled, _installQueue.Count));
+                _installQueue.Clear();
+            }
+
             if (_installQueue.Count == 0)
             {
-                _isInstalling = false;
-                EditorUtility.ClearProgressBar();
-                StartListRequest();
+                FinishInstall();
                 return;
             }
 
-            PackageRow row       = _installQueue.Peek();
-            string     packageId = BuildPackageIdentifier(row.Entry);
+            // Persist BEFORE Client.Add: if the install triggers a domain reload,
+            // OnEnable picks the queue back up from here.
+            InstallQueueState.Save(_installTabAssetPath, _installedCount, _totalToInstall,
+                                   _installQueue.Select(r => r.Entry.id));
 
-            EditorUtility.DisplayProgressBar(
-                "INVELON — Instalando dependencias",
-                $"Instalando {row.Entry.displayName ?? row.Entry.id}\u2026",
-                _totalToInstall > 0 ? (float)_installedCount / _totalToInstall : 0f);
+            PackageRow row = _installQueue.Peek();
+            ShowInstallProgress(row);
 
-            if (row.Entry.source == "openupm")
+            if (row.Entry.source == PackageSourceIds.OpenUpm)
                 EnsureOpenUpmScopedRegistry(row.Entry);
 
-            if (row.Entry.source == "tarball")
-                EnsureTarballInManifest(row.Entry);
+            if (row.Entry.source == PackageSourceIds.Tarball && !EnsureTarballInManifest(row.Entry))
+            {
+                row.Status       = PackageStatus.Error;
+                row.ErrorMessage = string.Format(InstallerStrings.LogTgzNotFound, ResolveTgzFileName(row.Entry));
+                _installQueue.Dequeue();
+                _installedCount++;
+                ProcessQueue();
+                return;
+            }
 
-            _addRequest = Client.Add(packageId);
+            _addRequest = Client.Add(BuildPackageIdentifier(row.Entry));
             EditorApplication.update += PollAddRequest;
         }
 
         private void PollAddRequest()
         {
-            if (_addRequest == null || !_addRequest.IsCompleted) return;
+            if (_addRequest == null)
+            {
+                EditorApplication.update -= PollAddRequest;
+                return;
+            }
+
+            if (!_addRequest.IsCompleted)
+            {
+                // Keep the (cancelable) progress bar alive while UPM works.
+                if (_installQueue.Count > 0)
+                    ShowInstallProgress(_installQueue.Peek());
+                return;
+            }
 
             EditorApplication.update -= PollAddRequest;
 
@@ -804,8 +740,8 @@ namespace INVELON.Editor
             else
             {
                 row.Status       = PackageStatus.Error;
-                row.ErrorMessage = _addRequest.Error?.message ?? "Error desconocido.";
-                Debug.LogError($"[PackageManifestInstaller] Error instalando {row.Entry.id}: {row.ErrorMessage}");
+                row.ErrorMessage = _addRequest.Error?.message ?? InstallerStrings.LogUnknownError;
+                Debug.LogError(string.Format(InstallerStrings.LogInstallError, row.Entry.id, row.ErrorMessage));
             }
 
             _addRequest = null;
@@ -813,13 +749,62 @@ namespace INVELON.Editor
             ProcessQueue();
         }
 
-        /// <summary>Returns the EditorPrefs key used to store a manual "mark as installed" override for an Asset Store package.</summary>
+        private void ShowInstallProgress(PackageRow row)
+        {
+            float progress = _totalToInstall > 0 ? (float)_installedCount / _totalToInstall : 0f;
+            bool  cancel   = EditorUtility.DisplayCancelableProgressBar(
+                InstallerStrings.ProgressTitle,
+                string.Format(InstallerStrings.ProgressInstalling,
+                    row.Entry.displayName ?? row.Entry.id, _installedCount + 1, _totalToInstall),
+                progress);
+
+            if (cancel) _cancelRequested = true;
+        }
+
+        private void FinishInstall()
+        {
+            _isInstalling    = false;
+            _cancelRequested = false;
+            InstallQueueState.Clear();
+            EditorUtility.ClearProgressBar();
+            StartListRequest();
+        }
+
+        // ── Package identifiers ───────────────────────────────────────────────
+
+        private static string BuildPackageIdentifier(PackageEntry entry)
+        {
+            switch (entry.source)
+            {
+                case PackageSourceIds.Git:
+                    return entry.url;
+
+                case PackageSourceIds.Tarball:
+                {
+                    string fileName    = ResolveTgzFileName(entry);
+                    string packagesDir = Path.GetFullPath(Path.Combine(Application.dataPath, "../Packages"));
+                    string fullPath    = Path.Combine(packagesDir, fileName);
+                    return $"file:{fullPath.Replace('\\', '/')}";
+                }
+
+                case PackageSourceIds.AssetStore:
+                    // Unreachable: the Install button is never shown for assetstore entries.
+                    Debug.LogWarning(string.Format(InstallerStrings.LogAssetStoreWarning, entry.id));
+                    return entry.id;
+
+                default:
+                    return $"{entry.id}@{entry.version}";
+            }
+        }
+
+        // ── Asset Store detection ─────────────────────────────────────────────
+
         private static string AssetStorePrefsKey(PackageEntry entry) =>
             $"INVELON.PMI.AssetStoreInstalled.{entry.id}";
 
         /// <summary>
-        /// Returns true when an Asset Store package can be considered installed:
-        ///   1. The dev has clicked "Mark Installed" (stored in EditorPrefs), OR
+        /// An Asset Store package counts as installed when:
+        ///   1. The dev has clicked "Mark OK" (stored in EditorPrefs), OR
         ///   2. assetFolderPath is set and the folder exists under Assets/.
         /// </summary>
         private static bool IsAssetStorePackageInstalled(PackageEntry entry)
@@ -836,59 +821,26 @@ namespace INVELON.Editor
 
             return false;
         }
-        private static string BuildPackageIdentifier(PackageEntry entry)
-        {
-            switch (entry.source)
-            {
-                case "git":
-                    return entry.url;
 
-                case "tarball":
-                {
-                    string fileName = ResolveTgzFileName(entry);
-                    string packagesDir = Path.GetFullPath(
-                        Path.Combine(Application.dataPath, "../Packages"));
-                    string fullPath = Path.Combine(packagesDir, fileName);
-                    // Client.Add accepts an absolute file:// URI or a file: path
-                    return $"file:{fullPath.Replace('\\', '/')}";
-                }
+        // ── Tarball helpers ───────────────────────────────────────────────────
 
-                case "assetstore":
-                    // Asset Store packages cannot be installed via Client.Add.
-                    // This case should never be reached because the Install button is
-                    // disabled for assetstore entries. Return a dummy string for safety.
-                    Debug.LogWarning(
-                        $"[PackageManifestInstaller] '{entry.id}' is an Asset Store package " +
-                        "and cannot be installed automatically. Download it from Package Manager - My Assets.");
-                    return entry.id;
-
-                default:
-                    return $"{entry.id}@{entry.version}";
-            }
-        }
-
-        /// <summary>Returns the resolved .tgz file name for a tarball entry.</summary>
         private static string ResolveTgzFileName(PackageEntry entry) =>
             !string.IsNullOrEmpty(entry.tgzFileName)
                 ? entry.tgzFileName
                 : $"{entry.id}-{entry.version}.tgz";
 
-        /// <summary>Returns true when the .tgz file for a tarball entry exists in Packages/.</summary>
         private static bool TarballFileExists(PackageEntry entry)
         {
-            string fileName    = ResolveTgzFileName(entry);
-            string packagesDir = Path.GetFullPath(
-                Path.Combine(Application.dataPath, "../Packages"));
-            return File.Exists(Path.Combine(packagesDir, fileName));
+            string packagesDir = Path.GetFullPath(Path.Combine(Application.dataPath, "../Packages"));
+            return File.Exists(Path.Combine(packagesDir, ResolveTgzFileName(entry)));
         }
 
-        // ──────────────────────────────────────────────────────────────────────────
-        //  OpenUPM scoped registry  (string-based, no external JSON library needed)
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── manifest.json edits (delegated to UpmManifestJson) ────────────────
 
         /// <summary>
-        /// Ensures the OpenUPM scoped registry for the given entry exists in Packages/manifest.json.
-        /// Uses string manipulation instead of a JSON library so this assembly has zero external dependencies.
+        /// Ensures the scoped registry for an openupm entry exists in Packages/manifest.json.
+        /// If a registry with the same URL exists, the scope is appended to it — no
+        /// duplicate registry blocks are created.
         /// </summary>
         private static void EnsureOpenUpmScopedRegistry(PackageEntry entry)
         {
@@ -897,210 +849,109 @@ namespace INVELON.Editor
 
             if (!File.Exists(manifestPath))
             {
-                Debug.LogError("[PackageManifestInstaller] Packages/manifest.json no encontrado.");
+                Debug.LogError(InstallerStrings.LogManifestNotFound);
                 return;
             }
 
             try
             {
-                string content = File.ReadAllText(manifestPath);
-
-                // Bail out if both the registry URL and the package scope are already present
-                if (content.Contains($"\"{entry.url}\"") && content.Contains($"\"{entry.id}\""))
-                {
-                    Debug.Log($"[PackageManifestInstaller] Scoped registry para '{entry.id}' ya existe.");
-                    return;
-                }
-
+                string content      = File.ReadAllText(manifestPath);
                 string registryName = !string.IsNullOrEmpty(entry.scopeName) ? entry.scopeName : entry.url;
 
-                string newBlock =
-                    "{\n" +
-                    $"      \"name\": \"{registryName}\",\n" +
-                    $"      \"url\": \"{entry.url}\",\n" +
-                    $"      \"scopes\": [\n" +
-                    $"        \"{entry.id}\"\n" +
-                    $"      ]\n" +
-                    $"    }}";
+                string updated = UpmManifestJson.AddScopedRegistry(
+                    content, registryName, entry.url, entry.id, out bool changed);
 
-                if (content.Contains("\"scopedRegistries\""))
+                if (changed)
                 {
-                    // Insert at the start of the existing scopedRegistries array
-                    int keyIdx     = content.IndexOf("\"scopedRegistries\"", StringComparison.Ordinal);
-                    int bracketIdx = content.IndexOf('[', keyIdx);
-                    content        = content.Insert(bracketIdx + 1, "\n    " + newBlock + ",");
+                    File.WriteAllText(manifestPath, updated);
+                    AssetDatabase.Refresh();
+                    Debug.Log(string.Format(InstallerStrings.LogRegistryAdded, entry.url, entry.id));
                 }
-                else
-                {
-                    // Append a new scopedRegistries section before the root closing brace
-                    int lastBrace = content.LastIndexOf('}');
-                    content       = content.Insert(lastBrace,
-                        $",\n  \"scopedRegistries\": [\n    {newBlock}\n  ]\n");
-                }
-
-                File.WriteAllText(manifestPath, content);
-                AssetDatabase.Refresh();
-
-                Debug.Log($"[PackageManifestInstaller] Scoped registry '{entry.url}' configurado para '{entry.id}'.");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[PackageManifestInstaller] Error al modificar manifest.json: {ex.Message}");
+                Debug.LogError(string.Format(InstallerStrings.LogRegistryError, ex.Message));
             }
         }
 
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Tarball (.tgz) local file registration
-        // ──────────────────────────────────────────────────────────────────────────
-
         /// <summary>
-        /// Registers a tarball package in Packages/manifest.json using a relative file: path
-        /// and removes any stale entry for the same package from packages-lock.json so Unity
-        /// re-resolves it cleanly on next domain reload.
+        /// Registers a tarball package in Packages/manifest.json (file: ref) and removes
+        /// any stale entry from packages-lock.json so UPM re-resolves it cleanly.
+        /// Returns false when the .tgz file or manifest.json is missing.
         /// </summary>
-        private static void EnsureTarballInManifest(PackageEntry entry)
+        private static bool EnsureTarballInManifest(PackageEntry entry)
         {
-            string packagesDir   = Path.GetFullPath(Path.Combine(Application.dataPath, "../Packages"));
-            string manifestPath  = Path.Combine(packagesDir, "manifest.json");
-            string lockPath      = Path.Combine(packagesDir, "packages-lock.json");
-            string fileName      = ResolveTgzFileName(entry);
-
-            // Relative path as understood by UPM when manifest.json lives in Packages/
-            string fileRef = $"file:./{fileName}";
+            string packagesDir  = Path.GetFullPath(Path.Combine(Application.dataPath, "../Packages"));
+            string manifestPath = Path.Combine(packagesDir, "manifest.json");
+            string lockPath     = Path.Combine(packagesDir, "packages-lock.json");
+            string fileName     = ResolveTgzFileName(entry);
+            string fileRef      = $"file:./{fileName}";
 
             if (!File.Exists(manifestPath))
             {
-                Debug.LogError("[PackageManifestInstaller] Packages/manifest.json no encontrado.");
-                return;
+                Debug.LogError(InstallerStrings.LogManifestNotFound);
+                return false;
             }
 
             if (!File.Exists(Path.Combine(packagesDir, fileName)))
             {
-                Debug.LogError(
-                    $"[PackageManifestInstaller] Archivo '{fileName}' no encontrado en Packages/. " +
-                    $"Cópialo allí antes de instalar.");
-                return;
+                Debug.LogError(string.Format(InstallerStrings.LogTgzNotFound, fileName));
+                return false;
             }
 
             try
             {
-                // ── manifest.json ──────────────────────────────────────────────────
                 string content = File.ReadAllText(manifestPath);
 
-                // Check if already registered (either as file: or with the exact ref)
-                bool alreadyRegistered =
-                    content.Contains($"\"{entry.id}\"") &&
-                    content.Contains("file:");
-
-                if (!alreadyRegistered)
+                if (!UpmManifestJson.IsTarballRegistered(content, entry.id))
                 {
-                    // Insert into the "dependencies" block
-                    int depsKeyIdx = content.IndexOf("\"dependencies\"", StringComparison.Ordinal);
-                    if (depsKeyIdx < 0)
+                    content = UpmManifestJson.SetDependency(content, entry.id, fileRef, out bool changed);
+                    if (changed)
                     {
-                        // No dependencies block — create a minimal one before closing brace
-                        int lastBrace = content.LastIndexOf('}');
-                        content = content.Insert(lastBrace,
-                            $",\n  \"dependencies\": {{\n    \"{entry.id}\": \"{fileRef}\"\n  }}\n");
+                        File.WriteAllText(manifestPath, content);
+                        Debug.Log(string.Format(InstallerStrings.LogTarballRegistered, fileName, fileRef));
                     }
-                    else
-                    {
-                        // Insert at the beginning of the existing dependencies object
-                        int openBrace = content.IndexOf('{', depsKeyIdx);
-                        content = content.Insert(openBrace + 1,
-                            $"\n    \"{entry.id}\": \"{fileRef}\",");
-                    }
-
-                    File.WriteAllText(manifestPath, content);
-                    Debug.Log(
-                        $"[PackageManifestInstaller] Tarball '{fileName}' registrado en manifest.json " +
-                        $"como '{fileRef}'.");
-                }
-                else
-                {
-                    Debug.Log(
-                        $"[PackageManifestInstaller] '{entry.id}' ya está registrado en manifest.json.");
                 }
 
-                // ── packages-lock.json ─────────────────────────────────────────────
-                // Remove the stale lock entry so UPM re-resolves from the .tgz file
                 if (File.Exists(lockPath))
                 {
                     string lockContent = File.ReadAllText(lockPath);
-                    if (lockContent.Contains($"\"{entry.id}\""))
+                    string newLock     = UpmManifestJson.RemoveDependencyEntry(lockContent, entry.id, out bool lockChanged);
+                    if (lockChanged)
                     {
-                        // Remove the package block from the lock file using a brace-counting walk
-                        lockContent = RemoveJsonKey(lockContent, entry.id);
-                        File.WriteAllText(lockPath, lockContent);
-                        Debug.Log(
-                            $"[PackageManifestInstaller] Entrada obsoleta de '{entry.id}' " +
-                            $"eliminada de packages-lock.json.");
+                        File.WriteAllText(lockPath, newLock);
+                        Debug.Log(string.Format(InstallerStrings.LogLockCleaned, entry.id));
                     }
                 }
 
                 AssetDatabase.Refresh();
+                return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError(
-                    $"[PackageManifestInstaller] Error al registrar tarball '{entry.id}': {ex.Message}");
+                Debug.LogError(string.Format(InstallerStrings.LogTarballError, entry.id, ex.Message));
+                return false;
             }
         }
 
-        /// <summary>
-        /// Removes a top-level JSON key and its value object from a JSON string.
-        /// Uses brace counting — does not require an external JSON library.
-        /// </summary>
-        private static string RemoveJsonKey(string json, string key)
-        {
-            string searchKey = $"\"{key}\"";
-            int    keyIdx    = json.IndexOf(searchKey, StringComparison.Ordinal);
-            if (keyIdx < 0) return json;
-
-            // Find the colon that follows the key
-            int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
-            if (colonIdx < 0) return json;
-
-            // Find the opening brace of the value
-            int valueStart = json.IndexOf('{', colonIdx);
-            if (valueStart < 0) return json;
-
-            // Count braces to find where the value object ends
-            int depth = 0, valueEnd = valueStart;
-            for (int i = valueStart; i < json.Length; i++)
-            {
-                if      (json[i] == '{') depth++;
-                else if (json[i] == '}') { depth--; if (depth == 0) { valueEnd = i; break; } }
-            }
-
-            // Include any leading comma or trailing comma + whitespace
-            int removeStart = keyIdx;
-            int removeEnd   = valueEnd + 1;
-
-            // Walk back to also consume the preceding comma and newline
-            while (removeStart > 0 && (json[removeStart - 1] == ',' || json[removeStart - 1] == '\n' || json[removeStart - 1] == '\r' || json[removeStart - 1] == ' '))
-                removeStart--;
-
-            // Consume trailing comma if no preceding comma was removed
-            if (removeEnd < json.Length && json[removeEnd] == ',')
-                removeEnd++;
-
-            return json.Remove(removeStart, removeEnd - removeStart);
-        }
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Export current packages
-        // ──────────────────────────────────────────────────────────────────────────
+        // ── Export current packages ───────────────────────────────────────────
 
         /// <summary>
-        /// Reads the currently installed packages and writes a snapshot *.dependencies.json
-        /// next to the active tab's manifest. Uses StringBuilder to avoid any JSON library dependency.
+        /// Reads the currently installed packages and writes a snapshot *.dependencies.json.
+        /// The user picks the destination via a save dialog (so exports don't silently
+        /// pile up next to the manifest and appear as bogus new tabs).
         /// </summary>
         private void ExportCurrentPackages(TemplateTab tab)
         {
+            string defaultDir  = Path.GetDirectoryName(tab.ManifestPath) ?? Application.dataPath;
+            string defaultName = $"exported-{DateTime.Now:yyyy-MM-dd-HHmm}.dependencies";
+            string outputPath  = EditorUtility.SaveFilePanel(
+                InstallerStrings.ExportDialogTitle, defaultDir, defaultName, "json");
+
+            if (string.IsNullOrEmpty(outputPath)) return;
+
             ListRequest exportRequest = Client.List(offlineMode: false, includeIndirectDependencies: false);
 
-            // Capture delegate reference so it can be removed from inside the callback
             EditorApplication.CallbackFunction pollDelegate = null;
             pollDelegate = () =>
             {
@@ -1110,140 +961,69 @@ namespace INVELON.Editor
 
                 if (exportRequest.Status != StatusCode.Success)
                 {
-                    Debug.LogError($"[PackageManifestInstaller] Export fallido: {exportRequest.Error?.message}");
+                    Debug.LogError(string.Format(InstallerStrings.LogExportFailed, exportRequest.Error?.message));
                     return;
                 }
 
                 string upmManifestPath = Path.GetFullPath(
                     Path.Combine(Application.dataPath, "../Packages/manifest.json"));
 
-                HashSet<string> openUpmScopes = BuildOpenUpmScopeSet(upmManifestPath);
+                var openUpmScopes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (File.Exists(upmManifestPath))
+                {
+                    try
+                    {
+                        openUpmScopes = UpmManifestJson.GetScopesForRegistriesMatching(
+                            File.ReadAllText(upmManifestPath), "openupm");
+                    }
+                    catch { /* malformed manifest — treat everything as registry */ }
+                }
 
-                string json       = BuildExportJson(tab.Manifest, exportRequest.Result, openUpmScopes);
-                string outputDir  = Path.GetDirectoryName(tab.ManifestPath) ?? Application.dataPath;
-                string outputName = $"exported-{DateTime.Now:yyyy-MM-dd-HHmm}.dependencies.json";
-                string outputPath = Path.Combine(outputDir, outputName);
+                IEnumerable<ExportPackage> exportPackages = exportRequest.Result.Select(p => new ExportPackage
+                {
+                    Id          = p.name,
+                    Version     = p.version,
+                    DisplayName = p.displayName,
+                    GitUrl      = p.source == PackageSource.Git ? ExtractGitUrl(p.packageId) : null
+                });
+
+                string json = ExportJsonBuilder.Build(
+                    tab.Manifest, Application.unityVersion, exportPackages, openUpmScopes);
 
                 File.WriteAllText(outputPath, json);
-                AssetDatabase.Refresh();
+                Debug.Log(string.Format(InstallerStrings.LogExported, outputPath));
 
-                Debug.Log($"[PackageManifestInstaller] Exportado a: {outputPath}");
+                string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."))
+                                         .Replace('\\', '/');
+                bool insideProject = outputPath.Replace('\\', '/')
+                                               .StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase);
 
-                DiscoverAndLoadManifests();
-                StartListRequest();
+                if (insideProject)
+                {
+                    AssetDatabase.Refresh();
+                    DiscoverAndLoadManifests();
+                    StartListRequest();
+                }
+                else
+                {
+                    EditorUtility.RevealInFinder(outputPath);
+                }
+
                 Repaint();
             };
 
             EditorApplication.update += pollDelegate;
         }
 
-        /// <summary>
-        /// Builds the export JSON using a StringBuilder.
-        /// Detects git packages via PackageSource and openupm via scoped registry inspection.
-        /// </summary>
-        private static string BuildExportJson(
-            TemplateManifest  existingManifest,
-            PackageCollection packages,
-            HashSet<string>   openUpmScopes)
+        /// <summary>Strips the "name@" prefix from a UPM packageId, leaving the git URL.</summary>
+        private static string ExtractGitUrl(string packageId)
         {
-            var sb = new StringBuilder();
-            sb.AppendLine("{");
-            sb.AppendLine($"  \"schemaVersion\": \"{SupportedSchemaVersion}\",");
-            sb.AppendLine($"  \"templateName\": \"{J(existingManifest?.templateName ?? "My Template")}\",");
-            sb.AppendLine($"  \"unityVersion\": \"{J(Application.unityVersion)}\",");
-            sb.AppendLine($"  \"renderPipeline\": \"{J(existingManifest?.renderPipeline ?? "")}\",");
-            sb.AppendLine($"  \"menuGroup\": \"{J(existingManifest?.menuGroup ?? "")}\",");
-            sb.AppendLine("  \"packages\": [");
-
-            List<UnityEditor.PackageManager.PackageInfo> pkgList = packages
-                .Where(p => !p.name.StartsWith("com.unity.modules.", StringComparison.Ordinal))
-                .OrderBy(p => p.name)
-                .ToList();
-
-            for (int i = 0; i < pkgList.Count; i++)
-            {
-                UnityEditor.PackageManager.PackageInfo pkg = pkgList[i];
-                bool        isGit  = pkg.source == PackageSource.Git;
-                bool        isUpm  = openUpmScopes.Contains(pkg.name);
-                // Asset Store packages are imported into Assets/ and do not appear in
-                // the UPM package list, so they will never surface here. The fallback
-                // keeps the mapping exhaustive for future-proofing.
-                string      source = isGit ? "git" : (isUpm ? "openupm" : "registry");
-                bool        isLast = i == pkgList.Count - 1;
-
-                sb.AppendLine("    {");
-                sb.AppendLine($"      \"id\": \"{J(pkg.name)}\",");
-                sb.AppendLine($"      \"version\": \"{J(pkg.version)}\",");
-                sb.AppendLine($"      \"source\": \"{source}\",");
-
-                if (isGit && !string.IsNullOrEmpty(pkg.packageId))
-                    sb.AppendLine($"      \"url\": \"{J(pkg.packageId)}\",");
-                else if (isUpm)
-                    sb.AppendLine($"      \"url\": \"https://package.openupm.com\",");
-
-                sb.AppendLine($"      \"displayName\": \"{J(pkg.displayName)}\",");
-                sb.AppendLine($"      \"optional\": false");
-                sb.Append("    }");
-                sb.AppendLine(isLast ? "" : ",");
-            }
-
-            sb.AppendLine("  ]");
-            sb.Append("}");
-            return sb.ToString();
+            if (string.IsNullOrEmpty(packageId)) return packageId;
+            int at = packageId.IndexOf('@');
+            return at >= 0 ? packageId.Substring(at + 1) : packageId;
         }
 
-        /// <summary>Returns all package IDs registered under an openupm scoped registry in manifest.json.</summary>
-        private static HashSet<string> BuildOpenUpmScopeSet(string manifestPath)
-        {
-            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (!File.Exists(manifestPath)) return result;
-
-            try
-            {
-                string content = File.ReadAllText(manifestPath);
-                if (!content.Contains("openupm")) return result;
-
-                // Find each registry block whose URL contains "openupm" and extract its scopes
-                var urlMatches = Regex.Matches(content,
-                    @"""url""\s*:\s*""([^""]*openupm[^""]*)""");
-
-                foreach (Match urlMatch in urlMatches)
-                {
-                    // Walk backward to find the opening { of this registry object
-                    int blockStart = content.LastIndexOf('{', urlMatch.Index);
-                    if (blockStart < 0) continue;
-
-                    // Walk forward counting braces to find the matching }
-                    int depth = 0, blockEnd = blockStart;
-                    for (int i = blockStart; i < content.Length; i++)
-                    {
-                        if      (content[i] == '{') depth++;
-                        else if (content[i] == '}') { depth--; if (depth == 0) { blockEnd = i; break; } }
-                    }
-
-                    string block = content.Substring(blockStart, blockEnd - blockStart + 1);
-
-                    // Extract quoted package IDs (com.xxx.yyy pattern) from the scopes list
-                    foreach (Match scope in Regex.Matches(block, @"""(com\.[a-z][a-zA-Z0-9._-]+)"""))
-                        result.Add(scope.Groups[1].Value);
-                }
-            }
-            catch { /* silently skip malformed manifest */ }
-
-            return result;
-        }
-
-        // ──────────────────────────────────────────────────────────────────────────
-        //  Helpers
-        // ──────────────────────────────────────────────────────────────────────────
-
-        /// <summary>Escapes a string for safe embedding as a JSON string value.</summary>
-        private static string J(string s) =>
-            (s ?? string.Empty)
-            .Replace("\\", "\\\\")
-            .Replace("\"", "\\\"")
-            .Replace("\n",  "\\n")
-            .Replace("\r",  "");
+        // ── Misc helpers ──────────────────────────────────────────────────────
 
         private static void PingTabAsset(TemplateTab tab)
         {
@@ -1257,7 +1037,7 @@ namespace INVELON.Editor
         {
             EditorGUILayout.Space(4);
             Rect r = EditorGUILayout.GetControlRect(false, 1f);
-            EditorGUI.DrawRect(r, new Color(0.30f, 0.30f, 0.30f, 0.50f));
+            EditorGUI.DrawRect(r, InstallerColors.Separator);
             EditorGUILayout.Space(4);
         }
     }

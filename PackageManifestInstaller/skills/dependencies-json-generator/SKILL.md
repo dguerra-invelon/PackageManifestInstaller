@@ -39,7 +39,7 @@ Ask (or infer from existing manifests):
 | `templateName` | "What should this template be called?" | Shown as the tab label in the installer |
 | `unityVersion` | "Which Unity version?" | E.g. `6000.3`. Informational. |
 | `renderPipeline` | "Which render pipeline — URP, HDRP, or Built-in?" | Informational. |
-| `menuGroup` | "Do you want a shortcut in the Unity menu bar? If so, what path?" | E.g. `INVELON/My Template`. Optional — omit if not needed. |
+| `menuGroup` | (Don't ask — informational only) | Optional grouping metadata, e.g. `INVELON/My Template`. Reserved for future use; the installer does not register menu shortcuts. Omit unless the user asks for it. |
 
 ---
 
@@ -124,7 +124,7 @@ If unsure, ask: *"Is this from the Unity Registry, a Git URL, OpenUPM, a local .
 
 - **File location**: The file **must** be inside `Assets/` (or an XLINK'd folder that maps into `Assets/`) so Unity indexes it as a TextAsset. If in doubt, place it at the root of the package folder that contains the `Editor/` subfolder.
 
-- **`schemaVersion`**: Always `"2.0"`. Never change this.
+- **`schemaVersion`**: Always write `"2.0"`. Never change this. (The installer accepts any `2.x` manifest — minor bumps are additive — but new files are always authored as `2.0`.)
 
 ---
 

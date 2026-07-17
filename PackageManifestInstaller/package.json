@@ -1,0 +1,17 @@
+{
+  "name": "com.invelon.package-manifest-installer",
+  "version": "2.1.0",
+  "displayName": "INVELON Package Manifest Installer",
+  "description": "Editor window that auto-discovers *.dependencies.json template manifests and installs their UPM packages (registry, git, OpenUPM, local tarball) with one click. Asset Store packages are tracked with folder-based detection. Zero external dependencies: compiles even when the rest of the project has errors.",
+  "unity": "2021.3",
+  "author": {
+    "name": "INVELON"
+  },
+  "keywords": [
+    "editor",
+    "package-manager",
+    "dependencies",
+    "installer",
+    "template"
+  ]
+}
